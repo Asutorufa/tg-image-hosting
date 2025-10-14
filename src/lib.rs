@@ -110,7 +110,17 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
         };
     });
 
-    router = router.get_async("/f/:file_id", async |_, ctx| {
+    router = router.get_async("/f/:file_id", async |req: Request, ctx| {
+        let cache = Cache::default();
+
+        match cache.get(CacheKey::from(&req), true).await {
+            Ok(v) => match v {
+                Some(v) => return Ok(v),
+                None => {}
+            },
+            _ => {}
+        };
+
         let file_id = match ctx.param("file_id") {
             Some(v) => Path::new(v),
             None => return Response::error("file_id not found", 400),
@@ -138,7 +148,24 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             Err(e) => return Response::error(e.to_string(), 500),
         };
 
-        Response::from_stream(file.map_err(|e| worker::Error::from(e.to_string())))
+        let headers = Headers::new();
+        let _ = headers.set("Cache-Control", "public, max-age=31536000");
+        let resp = ResponseBuilder::new()
+            .with_headers(headers)
+            .from_stream(file.map_err(|e| worker::Error::from(e.to_string())))?;
+
+        match cache.put(CacheKey::from(&req), resp).await {
+            Ok(_) => {}
+            Err(e) => return Response::error(e.to_string(), 500),
+        }
+
+        match cache.get(CacheKey::from(&req), true).await {
+            Ok(v) => match v {
+                Some(v) => return Ok(v),
+                None => return Response::error("file not found from cache", 500),
+            },
+            _ => return Response::error("file not found from cache", 500),
+        }
     });
 
     let resp = match router.run(req, env.deref().clone()).await {

@@ -49,7 +49,7 @@ INSERT INTO
     (?, ?, ?, ?, ?, ?, ?, ?, ?, strftime('%s', 'now'), strftime('%s', 'now'), ?) 
         ON CONFLICT(file_id)
         DO UPDATE
-    SET file_unique_id = ?,
+    SET
         thumbnail_file_id = ?, 
         thumbnail_file_unique_id = ?, 
         message_id = ?, 
@@ -63,7 +63,7 @@ INSERT INTO
 
 pub static SAVE_FILE_PATH: &str = r#"UPDATE files SET file_path = ? WHERE file_id = ?"#;
 
-pub static SELECT_FILE: &str = r#"SELECT * FROM files WHERE file_id = ?"#;
+pub static SELECT_FILE: &str = r#"SELECT * FROM files WHERE file_id = ? OR file_unique_id = ?"#;
 
 #[derive(Debug)]
 pub struct Error(pub String);
@@ -144,6 +144,8 @@ pub async fn handle(
                             None => "".to_string(),
                         };
                         response += format!("https://{}/f/{}{}\n", host, f.file_id, ext).as_str();
+                        response +=
+                            format!("https://{}/f/{}{}\n", host, f.file_unique_id, ext).as_str();
                     }
                 }
                 Err(e) => {
@@ -365,7 +367,6 @@ impl D1 {
                         f.mime_type.clone().into(),
                         f.file_path.clone().into(),
                         // on conflict
-                        f.file_unique_id.into(),
                         f.thumbnail_file_id.into(),
                         f.thumbnail_file_unique_id.into(),
                         f.message_id.to_string().into(),
@@ -398,7 +399,10 @@ impl D1 {
 
     pub async fn get(&self, file_id: String) -> Result<File, Error> {
         let statement = self.db.prepare(SELECT_FILE);
-        let result = statement.bind(&vec![file_id.into()])?.run().await?;
+        let result = statement
+            .bind(&vec![file_id.clone().into(), file_id.into()])?
+            .run()
+            .await?;
 
         if !result.error().is_none() {
             return Err(Error(result.error().unwrap().to_string()));
