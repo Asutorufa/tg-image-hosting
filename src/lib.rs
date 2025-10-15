@@ -14,13 +14,11 @@ use web_sys::ReadableStream;
 use worker::*;
 
 fn get_string_from_env(env: &Env, key: &str) -> String {
-    match env.var(key) {
-        Ok(v) => match v.as_ref().as_string() {
-            Some(v) => v,
-            None => "".to_string(),
-        },
-        _ => "".to_string(),
+    if let Ok(v) = env.var(key) {
+        return v.to_string();
     }
+
+    String::new()
 }
 
 // Multiple calls to `init` will cause a panic as a tracing subscriber is already set.
@@ -52,6 +50,14 @@ async fn main(req: Request, env: Env, global_ctx: Context) -> Result<Response> {
         return Response::ok("");
     }
 
+    let host = &match req.url() {
+        Ok(v) => match v.host() {
+            Some(v) => v.to_string(),
+            None => return Response::error("no host", 500),
+        },
+        Err(e) => return Response::error(e.to_string(), 500),
+    };
+
     let router = Router::with_data(match init_bot(&env) {
         Ok(v) => v,
         Err(e) => {
@@ -59,8 +65,8 @@ async fn main(req: Request, env: Env, global_ctx: Context) -> Result<Response> {
             return Response::ok(format!("Error: {}", e));
         }
     })
-    .on_async("/tgbot/register", async |req, ctx| {
-        let url = format!("https://{}/tgbot", req.url()?.host().unwrap());
+    .on_async("/tgbot/register", async |_req, ctx| {
+        let url = format!("https://{}/tgbot", host);
 
         match ctx.data.set_webhook(url.as_ref()).await {
             Ok(_) => Response::ok(format!("register webhook to {} successful", url)),
@@ -81,65 +87,47 @@ async fn main(req: Request, env: Env, global_ctx: Context) -> Result<Response> {
 
         info!("body: {:?}", update);
 
-        let host = req.url()?.host().unwrap().to_string();
-
-        return match ctx.data.handle(host, update).await {
-            Ok(_) => {
-                info!("Update was handled by bot.");
-                Response::ok("Update was handled by bot.")
-            }
-            Err(e) => {
-                error!("Update was not handled by bot: {}", e);
-                Response::ok(format!("Update was not handled by bot: {}", e))
-            }
+        match ctx.data.handle(host, update).await {
+            Ok(_) => info!("Update was handled by bot."),
+            Err(e) => error!("Update was not handled by bot: {}", e),
         };
+
+        return Response::ok("ok");
     })
-    .get_async("/f/:file_id", async |req: Request, ctx| {
+    .get_async("/f/:file_id", async |_, ctx| {
         let cache = Cache::default();
 
-        match cache.get(CacheKey::from(&req), true).await {
-            Ok(v) => match v {
-                Some(v) => return Ok(v),
-                None => {}
-            },
-            _ => {}
-        };
-
-        let opt = ctx.data.clone();
-
-        let file_id = match ctx.param("file_id") {
-            Some(v) => Path::new(v),
+        let (file_id, ext) = match ctx.param("file_id") {
+            Some(v) => {
+                let p = Path::new(v);
+                (
+                    p.file_stem().unwrap_or_default().to_string_lossy(),
+                    p.extension().unwrap_or_default().to_string_lossy(),
+                )
+            }
             None => return Response::error("file_id not found", 400),
         };
 
-        info!(
-            "file id: {}, ext: {}",
-            file_id.file_stem().unwrap_or_default().to_string_lossy(),
-            file_id.extension().unwrap_or_default().to_string_lossy()
-        );
+        let url = format!("https://{}/f/{}.{}", host, file_id, ext);
 
-        let url = match opt
-            .get_file_url(
-                file_id
-                    .file_stem()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string(),
-            )
-            .await
-        {
+        let cache_key = Request::new(&url, Method::Get)?;
+
+        if let Ok(Some(v)) = cache.get(CacheKey::from(&cache_key), true).await {
+            return Ok(v);
+        }
+
+        let opt = ctx.data.clone();
+
+        info!("file id: {}, ext: {}", file_id, ext);
+
+        let url = match opt.get_file_url(file_id).await {
             Ok(v) => v,
             Err(e) => return Response::error(e.to_string(), 500),
         };
 
-        let file = match download(url).await {
+        let stream = match download(url).await {
             Ok(v) => v,
             Err(e) => return Response::error(e.to_string(), 500),
-        };
-
-        let stream = match &file.body() {
-            ResponseBody::Stream(edge_request) => edge_request.clone(),
-            _ => return Err(Error::RustError("body is not streamable".into())),
         };
 
         let tee_off = stream.tee();
@@ -165,17 +153,12 @@ async fn main(req: Request, env: Env, global_ctx: Context) -> Result<Response> {
                 }
             };
 
-            match cache
-                .put(
-                    CacheKey::from(&req),
-                    ResponseBuilder::new()
-                        .with_headers(headers.clone())
-                        .body(ResponseBody::Stream(s2)),
-                )
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => error!("put cache error: {}", e),
+            let resp = ResponseBuilder::new()
+                .with_headers(headers.clone())
+                .body(ResponseBody::Stream(s2));
+
+            if let Err(e) = cache.put(CacheKey::from(&cache_key), resp).await {
+                error!("put cache error: {}", e);
             };
         });
 
@@ -198,7 +181,7 @@ async fn main(req: Request, env: Env, global_ctx: Context) -> Result<Response> {
     })
 }
 
-async fn download(url: String) -> std::result::Result<Response, Error> {
+async fn download(url: String) -> std::result::Result<ReadableStream, Error> {
     let request = Request::new_with_init(
         url.as_str(),
         &RequestInit {
@@ -212,11 +195,12 @@ async fn download(url: String) -> std::result::Result<Response, Error> {
         },
     )?;
 
-    let mut response = Fetch::Request(request).send().await?;
+    let response = Fetch::Request(request).send().await?;
 
-    let _ = response
-        .headers_mut()
-        .set("Cache-Control", "max-age=31536000");
+    let stream = match &response.body() {
+        ResponseBody::Stream(edge_request) => edge_request.clone(),
+        _ => return Err(Error::RustError("body is not streamable".into())),
+    };
 
-    Ok(response)
+    Ok(stream)
 }

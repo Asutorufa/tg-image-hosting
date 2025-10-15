@@ -2,10 +2,11 @@
 
 ## deploy
 
+[![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/Asutorufa/tg-image-hosting)
+
 edit wrangler.toml
 
 ```shell
-copy wrangler.template.toml wrangler.toml
 vim wrangler.toml
 ```
 
@@ -15,7 +16,7 @@ change `database_name`, `database_id` to your d1 database name and uuid.
 deploy
 
 ```shell
-npx wrangler deploy
+npx wrangler deploy -c wrangler.toml
 ```
 
 register webhook

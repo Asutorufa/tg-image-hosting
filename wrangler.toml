@@ -1,0 +1,25 @@
+name = "tg-image-hosting"
+main = "build/worker/shim.mjs"
+compatibility_date = "2023-03-22"
+
+[build]
+command = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs > rustup.sh && sh rustup.sh -y && export PATH='$HOME/.cargo/bin:$PATH' && cargo install worker-build && worker-build --release"
+
+[vars]
+TELEGRAM_TOKEN = ""
+MAINTAINER_ID = ""  # send random word to the chat id when cron job run
+
+[observability.logs]
+enabled = true
+
+[[d1_databases]]
+binding = "DB"
+database_name = ""
+database_id = ""
+
+[[hyperdrive]]
+"binding" = "HYPERDRIVE"
+"id" = ""
+
+[placement]
+mode = "smart"

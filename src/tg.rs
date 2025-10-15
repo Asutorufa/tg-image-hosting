@@ -52,7 +52,7 @@ impl TgBot {
 
     pub async fn handle(
         self,
-        host: String,
+        host: &String,
         update: frankenstein::updates::Update,
     ) -> Result<(), Error> {
         match update.content {
@@ -113,8 +113,14 @@ impl TgBot {
         Ok(())
     }
 
-    pub async fn get_file_url(self, file_id: String) -> Result<String, Error> {
-        let file = self.d1.get(file_id.clone()).await?;
+    pub async fn get_file_url(self, file_id: impl Into<String>) -> Result<String, Error> {
+        let file_id = file_id.into();
+
+        if file_id.is_empty() {
+            return Err(Error("File id is empty".to_string()));
+        }
+
+        let file = self.d1.get(file_id).await?;
 
         let file_path = match file.file_path.as_str() {
             "" => {
