@@ -1,21 +1,19 @@
 pub mod consolelog;
+pub mod d1;
+pub mod error;
 pub mod tg;
 
-use crate::tg::D1;
-use frankenstein::client_reqwest::Bot;
+use crate::tg::TgBot;
 use frankenstein::updates::Update;
-use futures_util::TryStreamExt;
+use log::error;
 use log::info;
-use log::{debug, error};
-use std::ops::Deref;
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::Once;
+use wasm_bindgen::JsCast;
+use web_sys::ReadableStream;
 use worker::*;
 
-static INIT: Once = Once::new();
-
-fn get_string_from_env(env: Arc<Env>, key: &str) -> String {
+fn get_string_from_env(env: &Env, key: &str) -> String {
     match env.var(key) {
         Ok(v) => match v.as_ref().as_string() {
             Some(v) => v,
@@ -25,82 +23,69 @@ fn get_string_from_env(env: Arc<Env>, key: &str) -> String {
     }
 }
 
-#[derive(Clone)]
-pub struct RunOpt {
-    pub matainer: i64,
-    pub d1: D1,
-    pub bot: Arc<Bot>,
-    pub bot_token: String,
+// Multiple calls to `init` will cause a panic as a tracing subscriber is already set.
+// So we use the `start` event to initialize our tracing subscriber when the worker starts.
+#[event(start)]
+fn start() {
+    console_error_panic_hook::set_once();
+    match consolelog::init_with_level(log::Level::Info) {
+        Err(e) => console_error!("Failed to init console log: {}", e),
+        _ => console_log!("Console log initialized"),
+    };
 }
 
-async fn get_opt(env: Arc<Env>) -> Result<RunOpt> {
-    console_error_panic_hook::set_once();
-    INIT.call_once(|| {
-        match consolelog::init_with_level(log::Level::Info) {
-            Err(e) => console_error!("Failed to init console log: {}", e),
-            _ => console_log!("Console log initialized"),
-        };
-    });
+fn init_bot(env: &Env) -> Result<TgBot> {
+    let token = get_string_from_env(env, "TELEGRAM_TOKEN");
 
-    let token = get_string_from_env(env.clone(), "TELEGRAM_TOKEN");
-
-    let maintainer_id = get_string_from_env(env.clone(), "MAINTAINER_ID")
+    let maintainer_id = get_string_from_env(env, "MAINTAINER_ID")
         .parse::<i64>()
         .unwrap_or(0);
 
-    let d1 = tg::D1::new(Arc::new(env.d1("DB")?));
+    let d1 = d1::D1::new(Arc::new(env.d1("DB")?));
 
-    Ok(RunOpt {
-        bot: Arc::new(Bot::new(&token)),
-        matainer: maintainer_id,
-        d1,
-        bot_token: token,
-    })
+    Ok(TgBot::new(d1, maintainer_id, token))
 }
 
 #[event(fetch)]
-async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
+async fn main(req: Request, env: Env, global_ctx: Context) -> Result<Response> {
     if req.method() == Method::Options {
         return Response::ok("");
     }
 
-    let env = Arc::new(env);
-    let opt = match get_opt(env.clone()).await {
+    let router = Router::with_data(match init_bot(&env) {
         Ok(v) => v,
         Err(e) => {
             error!("{}", e);
             return Response::ok(format!("Error: {}", e));
         }
-    };
-
-    let mut router = Router::new();
-
-    router = router.on_async("/tgbot/register", async |req, _ctx| {
+    })
+    .on_async("/tgbot/register", async |req, ctx| {
         let url = format!("https://{}/tgbot", req.url()?.host().unwrap());
 
-        match tg::set_webhook(&opt.bot, url.as_ref(), opt.matainer).await {
+        match ctx.data.set_webhook(url.as_ref()).await {
             Ok(_) => Response::ok(format!("register webhook to {} successful", url)),
             Err(e) => Response::error(e.to_string(), 500),
         }
-    });
-
-    router = router.on_async("/d1/create_table", async |_, _ctx| {
-        match opt.d1.init().await {
+    })
+    .on_async("/d1/create_table", async |_, ctx| {
+        match ctx.data.d1.init().await {
             Ok(_) => Response::ok(format!("create table [words] successful")),
             Err(e) => Response::error(e.to_string(), 500),
         }
-    });
+    })
+    .post_async("/tgbot", async |mut req, ctx| {
+        let update = match req.json::<Update>().await {
+            Ok(v) => v,
+            Err(e) => return Response::error(e.to_string(), 400),
+        };
 
-    router = router.post_async("/tgbot", async |mut req, _ctx| {
-        let update = req.json::<Update>().await?;
-
-        debug!("body: {:?}", update);
+        info!("body: {:?}", update);
 
         let host = req.url()?.host().unwrap().to_string();
 
-        return match tg::handle(opt.d1.clone(), &opt.bot, host, update).await {
+        return match ctx.data.handle(host, update).await {
             Ok(_) => {
-                debug!("Update was handled by bot.");
+                info!("Update was handled by bot.");
                 Response::ok("Update was handled by bot.")
             }
             Err(e) => {
@@ -108,9 +93,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
                 Response::ok(format!("Update was not handled by bot: {}", e))
             }
         };
-    });
-
-    router = router.get_async("/f/:file_id", async |req: Request, ctx| {
+    })
+    .get_async("/f/:file_id", async |req: Request, ctx| {
         let cache = Cache::default();
 
         match cache.get(CacheKey::from(&req), true).await {
@@ -120,6 +104,8 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             },
             _ => {}
         };
+
+        let opt = ctx.data.clone();
 
         let file_id = match ctx.param("file_id") {
             Some(v) => Path::new(v),
@@ -132,53 +118,105 @@ async fn main(req: Request, env: Env, _ctx: Context) -> Result<Response> {
             file_id.extension().unwrap_or_default().to_string_lossy()
         );
 
-        let file = match tg::get_file(
-            opt.d1.clone(),
-            opt.bot.clone(),
-            opt.bot_token.clone(),
-            file_id
-                .file_stem()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string(),
-        )
-        .await
+        let url = match opt
+            .get_file_url(
+                file_id
+                    .file_stem()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string(),
+            )
+            .await
         {
             Ok(v) => v,
             Err(e) => return Response::error(e.to_string(), 500),
         };
 
+        let file = match download(url).await {
+            Ok(v) => v,
+            Err(e) => return Response::error(e.to_string(), 500),
+        };
+
+        let stream = match &file.body() {
+            ResponseBody::Stream(edge_request) => edge_request.clone(),
+            _ => return Err(Error::RustError("body is not streamable".into())),
+        };
+
+        let tee_off = stream.tee();
+
+        let s1: ReadableStream = match tee_off.get(0).dyn_into() {
+            Ok(v) => v,
+            Err(e) => return Response::error(e.as_string().unwrap_or_default(), 500),
+        };
+
         let headers = Headers::new();
         let _ = headers.set("Cache-Control", "public, max-age=31536000");
+
         let resp = ResponseBuilder::new()
-            .with_headers(headers)
-            .from_stream(file.map_err(|e| worker::Error::from(e.to_string())))?;
+            .with_headers(headers.clone())
+            .body(ResponseBody::Stream(s1));
 
-        match cache.put(CacheKey::from(&req), resp).await {
-            Ok(_) => {}
-            Err(e) => return Response::error(e.to_string(), 500),
-        }
+        global_ctx.wait_until(async move {
+            let s2: ReadableStream = match tee_off.get(1).dyn_into() {
+                Ok(v) => v,
+                Err(e) => {
+                    error!("get stream error: {}", e.as_string().unwrap_or_default());
+                    return;
+                }
+            };
 
-        match cache.get(CacheKey::from(&req), true).await {
-            Ok(v) => match v {
-                Some(v) => return Ok(v),
-                None => return Response::error("file not found from cache", 500),
-            },
-            _ => return Response::error("file not found from cache", 500),
-        }
+            match cache
+                .put(
+                    CacheKey::from(&req),
+                    ResponseBuilder::new()
+                        .with_headers(headers.clone())
+                        .body(ResponseBody::Stream(s2)),
+                )
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => error!("put cache error: {}", e),
+            };
+        });
+
+        Ok(resp)
+    })
+    .on_async("/", async |_req, _ctx| {
+        return Response::redirect(
+            Url::parse("https://github.com/Asutorufa/tg-image-hosting").unwrap(),
+        );
+    })
+    .or_else_any_method_async("/*catchall", async |_req, _ctx| {
+        return Response::redirect(
+            Url::parse("https://github.com/Asutorufa/tg-image-hosting").unwrap(),
+        );
     });
 
-    let resp = match router.run(req, env.deref().clone()).await {
+    Ok(match router.run(req, env).await {
         Ok(v) => v,
         Err(e) => return Response::error(e.to_string(), 500),
-    };
+    })
+}
 
-    // if resp.status_code() == 404 {
-    //     return env
-    //         .assets("ASSETS")?
-    //         .fetch_request(req.clone().unwrap())
-    //         .await;
-    // }
+async fn download(url: String) -> std::result::Result<Response, Error> {
+    let request = Request::new_with_init(
+        url.as_str(),
+        &RequestInit {
+            method: Method::Get,
+            cf: CfProperties {
+                cache_ttl: Some(31536000),
+                cache_everything: Some(true),
+                ..CfProperties::default()
+            },
+            ..RequestInit::default()
+        },
+    )?;
 
-    Ok(resp)
+    let mut response = Fetch::Request(request).send().await?;
+
+    let _ = response
+        .headers_mut()
+        .set("Cache-Control", "max-age=31536000");
+
+    Ok(response)
 }
