@@ -2,6 +2,8 @@ use crate::tg::TgBot;
 use frankenstein::updates::Update;
 use log::error;
 use log::info;
+use log::warn;
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 use wasm_bindgen::JsCast;
@@ -86,7 +88,7 @@ impl Handler {
         file_id: &str,
         ext: &str,
     ) -> std::result::Result<ReadableStream, crate::error::Error> {
-        let (url, file_uniq_id) = self.bot.get_file_url(file_id).await?;
+        let (url, file_uniq_id) = self.bot.get_file_url(file_id, false).await?;
 
         let r2_key = format!("{}.{}", file_uniq_id, ext);
 
@@ -102,12 +104,27 @@ impl Handler {
 
         info!("download from raw");
 
-        self.put_to_r2(&r2_key, download(url).await?).await
+        let stream = match download(url).await? {
+            DownloadResult::Stream(v) => v,
+            DownloadResult::NotFound => {
+                // retry to get path
+                warn!("file not found, retry to get new path");
+                let (url, _) = self.bot.get_file_url(file_id, true).await?;
+                match download(url).await? {
+                    DownloadResult::Stream(v) => v,
+                    DownloadResult::NotFound => {
+                        return Err(crate::error::Error("file not found".into()));
+                    }
+                }
+            }
+        };
+
+        self.put_to_r2(&r2_key, stream).await
     }
 
     pub async fn download(
         &self,
-        _: Request,
+        _req: Request,
         ctx: RouteContext<()>,
     ) -> std::result::Result<Response, crate::error::Error> {
         let file_name = match ctx.param("file_id") {
@@ -123,9 +140,19 @@ impl Handler {
 
         let cache_key = Request::new(&url, Method::Get)?;
 
+        // let no_cache = req
+        //     .query::<HashMap<String, String>>()
+        //     .unwrap_or_default()
+        //     .get("no_cache")
+        //     .unwrap_or(&"false".to_string())
+        //     .parse::<bool>()
+        //     .unwrap_or_default();
+
+        // if !no_cache {
         if let Some(v) = self.get_cache(&cache_key).await {
             return Ok(v);
         }
+        // }
 
         let stream = self.get_file(file_id.as_ref(), ext.as_ref()).await?;
 
@@ -180,26 +207,41 @@ fn splite_readable_stream(
     Ok((tee_off.get(0).dyn_into()?, tee_off.get(1).dyn_into()?))
 }
 
-async fn download(url: String) -> std::result::Result<ReadableStream, Error> {
+pub enum DownloadResult {
+    Stream(ReadableStream),
+    NotFound,
+}
+async fn download(url: String) -> std::result::Result<DownloadResult, crate::error::Error> {
     let request = Request::new_with_init(
         url.as_str(),
         &RequestInit {
             method: Method::Get,
             cf: CfProperties {
-                cache_ttl: Some(31536000),
-                cache_everything: Some(true),
+                cache_ttl_by_status: Some(HashMap::from([("200-299".to_string(), 31536000)])),
                 ..CfProperties::default()
             },
             ..RequestInit::default()
         },
     )?;
 
-    let response = Fetch::Request(request).send().await?;
+    let mut response = Fetch::Request(request).send().await?;
+
+    if response.status_code() == 404 {
+        return Ok(DownloadResult::NotFound);
+    }
+
+    if response.status_code() != 200 {
+        return Err(crate::error::Error(format!(
+            "status code is not 200, but {}, {}",
+            response.status_code(),
+            response.text().await?
+        )));
+    }
 
     let stream = match &response.body() {
         ResponseBody::Stream(edge_request) => edge_request,
-        _ => return Err(Error::RustError("body is not streamable".into())),
+        _ => return Err(crate::error::Error("body is not streamable".into())),
     };
 
-    Ok(stream.clone())
+    Ok(DownloadResult::Stream(stream.clone()))
 }

@@ -63,7 +63,8 @@ pub static SAVE_FILE_PATH: &str = r#"
 UPDATE
     files
 SET
-    file_path = ?
+    file_path = ?, 
+    update_time = strftime('%s', 'now')
 WHERE
     file_unique_id = ?
 "#;
@@ -263,9 +264,13 @@ impl D1 {
                 (&f.thumbnail_file_id).into(),
                 (&f.thumbnail_file_unique_id).into(),
                 f.message_id.into(),
-                f.user_id.into(),
+                // u64 will be converted to bigint in JS which is not supported by D1
+                // so we need to convert it to string first
+                f.user_id.to_string().into(),
                 (&f.file_name).into(),
-                f.file_size.into(),
+                // i64 will be converted to bigint in JS which is not supported by D1
+                // so we need to convert it to string first
+                f.file_size.to_string().into(),
                 (&f.mime_type).into(),
                 (&f.file_path).into(),
             ];

@@ -120,6 +120,7 @@ impl TgBot {
     pub async fn get_file_url(
         &self,
         file_id: impl Into<String>,
+        no_cache: bool,
     ) -> Result<(String, String), Error> {
         let file_id = file_id.into();
 
@@ -131,7 +132,7 @@ impl TgBot {
 
         let mut file_path = file.file_path;
 
-        if file_path.is_empty() {
+        if no_cache || file_path.is_empty() {
             if let Some(p) = self
                 .bot
                 .get_file(&GetFileParams {
