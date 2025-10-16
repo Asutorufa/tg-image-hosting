@@ -1,5 +1,7 @@
 use frankenstein::reqwest;
 use std::fmt::Display;
+use wasm_bindgen::JsValue;
+use worker::Response;
 
 #[derive(Debug)]
 pub struct Error(pub String);
@@ -31,5 +33,17 @@ impl From<frankenstein::Error> for Error {
 impl From<reqwest::Error> for Error {
     fn from(err: reqwest::Error) -> Self {
         Error(err.to_string())
+    }
+}
+
+impl From<JsValue> for Error {
+    fn from(err: JsValue) -> Self {
+        Error(err.as_string().unwrap_or_default())
+    }
+}
+
+impl Error {
+    pub fn to_response(&self) -> worker::Result<Response> {
+        Response::error(&self.0, 500)
     }
 }

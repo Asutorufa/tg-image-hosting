@@ -21,5 +21,9 @@ database_id = ""
 "binding" = "HYPERDRIVE"
 "id" = ""
 
+[[r2_buckets]] # optional, if you want to cache or store files
+binding = 'R2'
+bucket_name = ''
+
 [placement]
 mode = "smart"

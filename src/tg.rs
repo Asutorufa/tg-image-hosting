@@ -30,7 +30,7 @@ impl TgBot {
         self.matainer
     }
 
-    pub async fn set_webhook(self, url: &str) -> Result<(), Error> {
+    pub async fn set_webhook(&self, url: &str) -> Result<(), Error> {
         info!("Registering webhook: {}", url);
 
         self.bot
@@ -50,8 +50,15 @@ impl TgBot {
         Ok(())
     }
 
+    fn get_ext(&self, path: &str) -> String {
+        path.rsplit('.')
+            .next()
+            .map(|e| format!(".{}", e))
+            .unwrap_or_default()
+    }
+
     pub async fn handle(
-        self,
+        &self,
         host: &String,
         update: frankenstein::updates::Update,
     ) -> Result<(), Error> {
@@ -63,7 +70,10 @@ impl TgBot {
                 let msg_id = msg.message_id;
 
                 let files = File::from_message(msg, async |f| {
-                    let ff = self.bot.get_file(&GetFileParams { file_id: f }).await?;
+                    let ff = self
+                        .bot
+                        .get_file(&GetFileParams { file_id: f.clone() })
+                        .await?;
                     match ff.result.file_path {
                         Some(p) => Ok(p),
                         None => return Err(Error("File path not found".to_string())),
@@ -75,25 +85,19 @@ impl TgBot {
                     return Ok(());
                 }
 
-                let mut response = String::new();
-
-                match self.d1.save(files.clone()).await {
-                    Ok(_) => {
-                        for f in files {
-                            let ext = match f.file_path.split('.').last() {
-                                Some(ext) => format!(".{}", ext),
-                                None => "".to_string(),
-                            };
-                            response +=
-                                format!("https://{}/f/{}{}\n", host, f.file_id, ext).as_str();
-                            response += format!("https://{}/f/{}{}\n", host, f.file_unique_id, ext)
-                                .as_str();
-                        }
-                    }
-                    Err(e) => {
-                        response = format!("Error: {}", e);
-                    }
-                }
+                let response = match self.d1.save(&files).await {
+                    Ok(_) => files
+                        .iter()
+                        .map(|f| {
+                            let ext = self.get_ext(&f.file_path);
+                            format!(
+                                "https://{}/f/{}{}\nhttps://{}/f/{}{}\n",
+                                host, f.file_id, ext, host, f.file_unique_id, ext
+                            )
+                        })
+                        .collect::<String>(),
+                    Err(e) => format!("Error: {}", e),
+                };
 
                 self.bot
                     .send_message(
@@ -113,46 +117,49 @@ impl TgBot {
         Ok(())
     }
 
-    pub async fn get_file_url(self, file_id: impl Into<String>) -> Result<String, Error> {
+    pub async fn get_file_url(
+        &self,
+        file_id: impl Into<String>,
+    ) -> Result<(String, String), Error> {
         let file_id = file_id.into();
 
         if file_id.is_empty() {
             return Err(Error("File id is empty".to_string()));
         }
 
-        let file = self.d1.get(file_id).await?;
+        let file = self.d1.get(&file_id).await?;
 
-        let file_path = match file.file_path.as_str() {
-            "" => {
-                let f = self
-                    .bot
-                    .get_file(&GetFileParams {
-                        file_id: file.file_id.clone(),
-                    })
-                    .await?;
+        let mut file_path = file.file_path;
 
-                match f.result.file_path {
-                    Some(p) => {
-                        self.d1
-                            .save_file_path(file.file_unique_id, p.clone())
-                            .await?;
-                        p
-                    }
-                    None => return Err(Error("File path not found".to_string())),
-                }
+        if file_path.is_empty() {
+            if let Some(p) = self
+                .bot
+                .get_file(&GetFileParams {
+                    file_id: file.file_id.clone(),
+                })
+                .await?
+                .result
+                .file_path
+            {
+                self.d1.save_file_path(&file.file_unique_id, &p).await?;
+                file_path = p;
             }
-            _ => file.file_path,
-        };
+        }
+
+        if file_path.is_empty() {
+            return Err(Error("File path is empty".to_string()));
+        }
 
         info!("File path: {}", file_path);
 
         // https://core.telegram.org/bots/api#getfile
-        let url = format!(
-            "https://api.telegram.org/file/bot{}/{}",
-            self.bot_token, file_path
-        );
-
-        Ok(url)
+        Ok((
+            format!(
+                "https://api.telegram.org/file/bot{}/{}",
+                self.bot_token, file_path
+            ),
+            file.file_unique_id,
+        ))
     }
 }
 
