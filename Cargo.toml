@@ -7,17 +7,17 @@ edition = "2024"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-frankenstein = { version = "0.45", features = ["client-reqwest"] }
+frankenstein = { version = "0.52", features = ["client-reqwest"] }
 serde = "1.0.228"
-worker = { version = "0.6", features = ["d1"] }
-worker-macros = "0.6"
+worker = { version = "0.8", features = ["d1"] }
+worker-macros = "0.8"
 console_error_panic_hook = "0.1"
 wasm-bindgen = "^0.2"
 web-sys = { version = "0.3", features = ["console"] }
 log = "0.4.28"
 futures-core = "0.3.31"
 bytes = "1.10.1"
-reqwest = { version = "0.12", default-features = false, features = [
+reqwest = { version = "0.13", default-features = false, features = [
     "rustls-tls",
     "json",
     "stream",
